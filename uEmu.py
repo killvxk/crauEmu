@@ -18,11 +18,31 @@ import threading
 import json
 import os
 import collections
+import struct
+
+# RopEditor imports
+import ida_funcs
+import ida_name
 
 # IDA Python SDK
 from idaapi import *
 from idc import *
 from idautils import *
+
+# PyQt
+from PyQt5.QtWidgets import (
+    QWidget, QApplication, QTextEdit, QVBoxLayout,
+    QTableWidget, QHBoxLayout, QPushButton, QTableView,
+    QAbstractItemView, QStyledItemDelegate, QMenu,
+    QAction, QLabel, QTabWidget, QTabBar, QLineEdit,
+    QToolButton
+)
+
+from PyQt5 import QtCore
+from PyQt5.QtCore import (
+    Qt, QAbstractTableModel, QVariant, QModelIndex, pyqtSignal
+)
+from PyQt5.QtGui import QBrush, QColor
 
 if IDA_SDK_VERSION >= 700:
     # functions
@@ -75,10 +95,6 @@ else:
     # classes
     IDAAPI_Choose       = Choose2
 
-# PyQt
-from PyQt5 import QtCore, QtWidgets
-from PyQt5.QtWidgets import (QPushButton, QHBoxLayout)
-
 # Unicorn SDK
 from unicorn import *
 from unicorn.arm_const import *
@@ -86,14 +102,16 @@ from unicorn.arm64_const import *
 from unicorn.mips_const import *
 from unicorn.x86_const import *
 
+
 # === Configuration
 
 class UEMU_CONFIG:
-    
+
     IDAViewColor_PC     = 0x00B3CBFF
     IDAViewColor_Reset  = 0xFFFFFFFF
 
     UnicornPageSize     = 0x1000
+
 
 # === Helpers
 
@@ -108,7 +126,7 @@ class UEMU_HELPERS:
             action_handler_t.__init__(self)
             self.action_handler = handler
             self.action_type = action
-    
+
         def activate(self, ctx):
             if ctx.form_type == BWN_DISASM:
                 self.action_handler.handle_menu_action(self.action_type)
@@ -123,11 +141,11 @@ class UEMU_HELPERS:
     @staticmethod
     def ALIGN_PAGE_DOWN(x):
         return x & ~(UEMU_CONFIG.UnicornPageSize - 1)
-        
+
     @staticmethod
     def ALIGN_PAGE_UP(x):
         return (x + UEMU_CONFIG.UnicornPageSize - 1) & ~(UEMU_CONFIG.UnicornPageSize-1)
-    
+
     @staticmethod
     def inf_is_be():
         if IDA_SDK_VERSION >= 700:
@@ -163,6 +181,24 @@ class UEMU_HELPERS:
                 return "mipsle"
         else:
             return ""
+
+    @staticmethod
+    def get_stack_register(arch):
+        if arch.startswith("arm64"):
+            arch = "arm64"
+        elif arch.startswith("arm"):
+            arch = "arm"
+        elif arch.startswith("mips"):
+            arch = "mips"
+
+        registers = {
+            "x64" : ("rsp", UC_X86_REG_RSP),
+            "x86" : ("esp", UC_X86_REG_ESP),
+            "arm" : ("SP", UC_ARM_REG_SP),
+            "arm64" : ("SP", UC_ARM64_REG_SP),
+            "mips" : ("sp", UC_MIPS_REG_29),
+        }
+        return registers[arch]
 
     @staticmethod
     def get_register_map(arch):
@@ -205,7 +241,7 @@ class UEMU_HELPERS:
                 [ "esp",    UC_X86_REG_ESP  ],
                 [ "eip",    UC_X86_REG_EIP  ],
                 [ "sp",     UC_X86_REG_SP   ],
-            ],        
+            ],
             "arm" : [
                 [ "R0",     UC_ARM_REG_R0  ],
                 [ "R1",     UC_ARM_REG_R1  ],
@@ -297,7 +333,7 @@ class UEMU_HELPERS:
                 [ "pc",     UC_MIPS_REG_PC  ],
             ]
         }
-        return registers[arch]  
+        return registers[arch]
 
     @staticmethod
     def get_register_bits(arch):
@@ -310,12 +346,12 @@ class UEMU_HELPERS:
 
         registers_bits = {
             "x64"   : 64,
-            "x86"   : 32,        
+            "x86"   : 32,
             "arm"   : 32,
             "arm64" : 64,
             "mips"  : 32
         }
-        return registers_bits[arch]  
+        return registers_bits[arch]
 
     @staticmethod
     def get_register_ext_map(arch):
@@ -330,7 +366,7 @@ class UEMU_HELPERS:
             "x64" : [
             ],
             "x86" : [
-            ],        
+            ],
             "arm" : [
             ],
             "arm64" : [
@@ -368,9 +404,9 @@ class UEMU_HELPERS:
                 [ "Q31",    UC_ARM64_REG_Q31 ],
             ],
             "mips" : [
-            ]            
+            ]
         }
-        return registers_ext[arch]  
+        return registers_ext[arch]
 
     @staticmethod
     def get_register_ext_bits(arch):
@@ -383,21 +419,21 @@ class UEMU_HELPERS:
 
         registers_ext_bits = {
             "x64"   : 0,
-            "x86"   : 0,        
+            "x86"   : 0,
             "arm"   : 0,
             "arm64" : 128,
             "mips"  : 0
         }
-        return registers_ext_bits[arch]  
+        return registers_ext_bits[arch]
 
     @staticmethod
     def is_thumb_ea(ea):
         def handler():
             if ph.id == PLFM_ARM and not ph.flag & PR_USE64:
                 if IDA_SDK_VERSION >= 700:
-                    t = get_sreg(ea, "T") # get T flag
+                    t = get_sreg(ea, "T")  # get T flag
                 else:
-                    t = get_segreg(ea, 20) # get T flag
+                    t = get_segreg(ea, 20)  # get T flag
                 return t is not BADSEL and t is not 0
             else:
                 return False
@@ -422,8 +458,10 @@ class UEMU_HELPERS:
         def __call__(self, flags):
             return not IDAAPI_HasValue(flags)
 
+
 def uemu_log(entry):
     msg("[" + UEMU_PLUGIN_NAME + "]: " + entry + "\n")
+
 
 # === uEmuInitView
 
@@ -431,6 +469,7 @@ class uEmuInitView(object):
     def __init__(self, owner):
         super(uEmuInitView, self).__init__()
         self.owner = owner
+
 
 # === uEmuCpuContextView
 
@@ -440,6 +479,7 @@ class uEmuCpuContextView(simplecustviewer_t):
         super(uEmuCpuContextView, self).__init__()
         self.hooks = None
         self.owner = owner
+        self.uc_reg_sp = owner.unicornEngine.uc_reg_sp
         self.extended = extended
         self.lastAddress = None
         self.lastContext = {}
@@ -484,9 +524,9 @@ class uEmuCpuContextView(simplecustviewer_t):
                         attach_dynamic_action_to_popup(widget, popup, action_desc_t(None, "Change Context", self.PopupActionHandler(self.form, self.form.menu_update),  None, None, -1))
                         attach_action_to_popup(widget, popup, "-", None)
 
-            if self.hooks == None:
+            if self.hooks is None:
                 self.hooks = Hooks(self)
-                self.hooks.hook()            
+                self.hooks.hook()
         else:
             self.menu_cols1 = self.AddPopupMenu("1 Column")
             self.menu_cols2 = self.AddPopupMenu("2 Columns")
@@ -542,7 +582,7 @@ class uEmuCpuContextView(simplecustviewer_t):
         else:
             regList = UEMU_HELPERS.get_register_map(arch)
         reg_cnt = len(regList)
-        lines = reg_cnt/cols if reg_cnt%cols==0 else (reg_cnt/cols) + 1
+        lines = reg_cnt / cols if reg_cnt % cols == 0 else (reg_cnt / cols) + 1
         line = ""
         for i in range(lines):
             if i != 0:
@@ -581,6 +621,29 @@ class uEmuCpuContextView(simplecustviewer_t):
                 line = line.ljust(35 * ((j/lines) + 1))
 
         self.AddLine(line)
+        self.AddLine('')
+
+        sp = context.reg_read(self.uc_reg_sp)
+
+        self.AddLine(COLSTR('  Stack at 0x%x' % sp, SCOLOR_AUTOCMT))
+        self.AddLine('')
+
+        arch = UEMU_HELPERS.get_arch()
+        reg_bit_size = UEMU_HELPERS.get_register_bits(arch)
+        reg_byte_size = reg_bit_size / 8
+
+        for i in range(-5, 11):
+            clr = SCOLOR_DREF if i < 0 else SCOLOR_INSN
+            cur_addr = (sp + i * reg_byte_size) % (1 << reg_bit_size)
+            line = ('  %016X: ' if reg_bit_size == 64 else'  %08X: ') % cur_addr
+            try:
+                value = context.mem_read(cur_addr, reg_byte_size)
+                value, = struct.unpack('Q' if reg_bit_size == 64 else 'I', value)
+                line += ('%016X' if reg_bit_size == 64 else '%08X') % value
+            except Exception:
+                line += '?' * reg_byte_size * 2
+
+            self.AddLine(COLSTR(line, clr))
 
         self.Refresh()
         self.lastArch = arch
@@ -594,6 +657,7 @@ class uEmuCpuContextView(simplecustviewer_t):
             self.owner.ext_context_view_closed()
         else:
             self.owner.context_view_closed()
+
 
 # === uEmuMemoryView
 
@@ -623,6 +687,7 @@ class uEmuMemoryView(simplecustviewer_t):
 
     def Create(self, title):
 
+        print type(title), `title`
         if not simplecustviewer_t.Create(self, title):
             return False
 
@@ -635,7 +700,11 @@ class uEmuMemoryView(simplecustviewer_t):
         if context is None:
             return
 
-        memory = context.mem_read(self.address, self.size)
+        try:
+            memory = context.mem_read(self.address, self.size)
+        except UcError:
+            return
+
 
         size = len(memory)
 
@@ -686,6 +755,656 @@ class uEmuMemoryView(simplecustviewer_t):
     def OnClose(self):
         self.owner.memory_view_closed(self.viewid)
 
+# === uEmuStackView
+
+class uEmuStackView(simplecustviewer_t):
+
+    stack_size = 0x400
+
+    def __init__(self, owner):
+        super(uEmuStackView, self).__init__()
+        self.owner = owner
+        arch = UEMU_HELPERS.get_arch()
+        _, self.uc_reg_sp = UEMU_HELPERS.get_stack_register(arch)
+
+    def Create(self, title):
+        if not simplecustviewer_t.Create(self, title):
+            return False
+        return True
+
+    def SetContent(self, context):
+
+        self.ClearLines()
+        if context is None:
+            return
+
+        sp = context.reg_read(self.uc_reg_sp)
+
+        for i in range(0, self.stack_size, 8):
+            try:
+                value = context.mem_read(sp + i, 8)
+                value, = struct.unpack('Q', value)
+                self.AddLine('%016X: 0x%016X' % (sp + i, value))
+            except Exception:
+                break
+
+    def OnClose(self):
+        self.owner.stack_view_closed()
+
+# === uEmuRopTraceView
+
+class uEmuRopTraceView(simplecustviewer_t):
+
+    def __init__(self, owner):
+        super(uEmuRopTraceView, self).__init__()
+        self.owner = owner
+        ue = owner.unicornEngine
+        self.uc_reg_sp = ue.uc_reg_sp
+        self.uc_reg_pc = ue.uc_reg_pc
+
+    def Create(self, title):
+        if not simplecustviewer_t.Create(self, title):
+            return False
+        return True
+
+    def SetContent(self, rop_tracer):
+        self.ClearLines()
+        self.AddLine(COLSTR('  [ Rop Tracer View ]', SCOLOR_AUTOCMT))
+        self.AddLine('')
+        if rop_tracer is None:
+            return
+        for line_addr, line_disas, line_changes in rop_tracer.get_trace():
+            if len(line_changes) > 0:
+                self.AddLine('%s: %s  %s' % (line_addr, COLSTR(line_disas, SCOLOR_INSN), COLSTR('# ' + line_changes, SCOLOR_DREF)))
+            else:
+                self.AddLine('%s: %s' % (line_addr, COLSTR(line_disas, SCOLOR_INSN)))
+
+    def OnClose(self):
+        self.owner.rop_trace_view_closed()
+
+# === RopEditorView
+
+def parse_int(value, default=0):
+    try:
+        return int(value)
+    except Exception as ex:
+        pass
+    try:
+        return int(value, 16)
+    except Exception as ex:
+        pass
+    return default
+
+class RopModel(QAbstractTableModel):
+
+    nameChanged = pyqtSignal()
+    
+    def __init__(self, name, addr, size, prev_size, values=[]):
+        super(RopModel, self).__init__()
+        self.name = name
+        self.addr = addr
+        self.init_addr = None
+        self.size = size
+        self.prev_size = prev_size
+        self.values = values
+        self.highlights = {}
+
+    def rowCount(self, parent):
+        return len(self.values) + 1
+
+    def columnCount(self, parent):
+        return 4
+    
+    def headerData(self, section, orientation, role):
+        if role == Qt.DisplayRole:
+            return ['Address', 'Value', 'Comments', 'Context'][section]
+
+    def data(self, index, role):
+        row = index.row()
+        col = index.column()
+        if role == Qt.DisplayRole:
+            if row == len(self.values):
+                return QVariant()
+            elif col == 0:
+                arch = UEMU_HELPERS.get_arch()
+                reg_bit_size = UEMU_HELPERS.get_register_bits(arch)
+                reg_byte_size = reg_bit_size // 8
+                if type(self.addr) in (str, unicode):
+                    addr_str = '{}+{:x}'.format(self.addr,  row * reg_byte_size)
+                else:
+                    addr_str = '0x{:x}'.format(self.addr + row * reg_byte_size)
+                if 0 <= row < len(self.values) and row in self.highlights:
+                    return '{} ({})'.format(addr_str, ', '.join(self.highlights[row]))
+                else:
+                    return addr_str
+            elif col == 1:
+                return self.values[row].get('addr', 0)
+            elif col == 2:
+                return self.values[row].get('cmt', '')
+            elif col == 3:
+                addr = self.values[row].get('addr', 0)
+                func = ida_funcs.get_func(addr)
+                if func is None or func.start_ea > addr:
+                    return QVariant()
+                name = ida_name.get_name(func.start_ea)
+                off = addr - func.start_ea
+                return '{} + 0x{:x}'.format(name, off)
+        elif role == Qt.BackgroundRole:
+            if 0 <= row < len(self.values) and row in self.highlights:
+                return QBrush(QColor(Qt.yellow))
+        return QVariant()
+    
+    def setData(self, index, value, role):
+        row = index.row()
+        col = index.column()
+        if role in (Qt.EditRole, Qt.DisplayRole):
+            if row == len(self.values):
+                self.insertRows(len(self.values), 1, QModelIndex())
+            if col == 1:
+                self.values[row]['addr'] = parse_int(value)
+            elif col == 2:
+                self.values[row]['cmt'] = value
+
+        return True
+
+    def flags(self, index):
+        row = index.row()
+        col = index.column()
+
+        flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled
+        if col in (1, 2):
+            flags |= Qt.ItemIsEditable
+        if row == -1 and col == -1:
+            flags |= Qt.ItemIsDropEnabled
+        return flags
+
+    def insertRows(self, row, count, parent):
+        self.beginInsertRows(parent, row, row + count - 1)
+        self.values = self.values[:row] + [{} for _ in range(count)] + self.values[row:]
+        self.endInsertRows()
+        return True
+
+    def removeRows(self, row, count, parent):
+        if row < len(self.values) and row + count <= len(self.values):
+            self.beginRemoveRows(parent, row, row + count - 1)
+            self.values = self.values[:row] + self.values[row + count:]
+            self.endRemoveRows()
+            return True
+        return False
+
+    def dropMimeData(self, data, action, row, col, parent):
+        if row == -1 or row > len(self.values):
+            return False
+        return super(RopModel, self).dropMimeData(data, action, row, 0, parent)
+
+    def supportedDropActions(self):
+        return Qt.MoveAction | Qt.CopyAction
+
+
+class HexDeligate(QStyledItemDelegate):
+
+    def displayText(self, value, locale):
+        try:
+            return '0x%x' % value
+        except TypeError:
+            return value
+
+    def setEditorData(self, editor, index):
+        editor.setText(self.displayText(index.data(), None))
+
+
+class RopView(QTableView):
+
+    def __init__(self, parent):
+        super(RopView, self).__init__(parent)
+        self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(20)
+        #self.horizontalHeader().hide()
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(self.DragDrop);
+        self.setDragDropOverwriteMode(False);
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setItemDelegateForColumn(1, HexDeligate())
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.contextMenu)
+
+        # actions
+        self.del_act = QAction('Delete', self)
+        self.del_act.triggered.connect(self.deleteSelectedRows)
+        self.del_act.setShortcut('Delete')
+        self.addAction(self.del_act)
+
+        self.jump_act = QAction('Jump to', self)
+        self.jump_act.triggered.connect(self.jumpTo)
+        self.jump_act.setShortcut('G')
+        self.addAction(self.jump_act)
+
+    def contextMenu(self, point):
+
+        select = self.selectionModel()
+
+        menu = QMenu(self)
+        menu.addAction(self.del_act)
+        menu.addAction(self.jump_act)
+        menu.popup(self.viewport().mapToGlobal(point))
+
+    def deleteSelectedRows(self, checked):
+        select = self.selectionModel()
+        if select.hasSelection():
+            selection = select.selectedRows()
+            rows = sorted([i.row() for i in selection], reverse=True)
+            for idx in rows:
+                self.model().removeRow(idx)
+
+    def jumpTo(self):
+        select = self.selectionModel()
+        if select.hasSelection():
+            values = self.model().values
+            selection = select.selectedRows()
+            idx = [i.row() for i in selection][0]
+            if 0 <= idx < len(values):
+                addr = values[idx].get('addr', -1)
+                IDAAPI_Jump(addr)
+
+
+class RopTracer:
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.contexts = []
+
+    def clear(self):
+        self.contexts = []
+
+    def trace(self):
+
+        if len(self.contexts) > 0 and self.contexts[-1]['pc'] == self.owner.pc:
+            return
+
+        line = UEMU_HELPERS.trim_spaces(IDAAPI_GetDisasm(self.owner.pc, 0))
+        context = {'pc': self.owner.pc, 'line': line, 'regs': {}}
+
+        arch = UEMU_HELPERS.get_arch()
+        regs_map = UEMU_HELPERS.get_register_map(arch)
+        for name, ue_reg_id in regs_map:
+            context['regs'][name] = self.owner.mu.reg_read(ue_reg_id)
+
+        self.contexts.append(context)
+
+    def get_trace(self):
+
+        arch = UEMU_HELPERS.get_arch()
+        reg_map = {i[1]: i[0] for i in UEMU_HELPERS.get_register_map(arch)}
+
+        uc_reg_sp = self.owner.uc_reg_sp
+        uc_reg_pc = self.owner.uc_reg_pc
+        
+
+        reg_sp_mnem = reg_map[uc_reg_sp]
+        reg_pc_mnem = reg_map[uc_reg_pc]
+
+        n = len(self.contexts)
+
+        lines = []
+        for i in range(n):
+            context = self.contexts[i]
+            next_context = self.contexts[i + 1] if i + 1 < n else None
+
+            line_disas = context['line']
+            regs = context['regs']
+
+            reg_changes = []
+            if next_context is not None:
+                reg_names = regs.keys()
+                next_regs = next_context['regs']
+                for reg_name in reg_names:
+                    if reg_name in (reg_sp_mnem, reg_pc_mnem):
+                        continue
+                    if next_regs[reg_name] != regs[reg_name]:
+                        reg_changes.append('%s = %016X' % (reg_name, next_regs[reg_name]))
+            line_addr = '%016X' % context['pc']
+            line_changes = ', '.join(reg_changes)
+
+            lines.append((line_addr, line_disas, line_changes))
+
+        return lines
+
+
+class RopTab(QWidget):
+
+    def __init__(self, parent, model):
+        super(RopTab, self).__init__(parent)
+        self.model = model
+        self.init_ui()
+
+    def init_ui(self):
+        self.rop_view = RopView(self)
+        self.rop_view.setModel(self.model)
+
+        self.name_edit = QLineEdit(self.model.name, self)
+        if type(self.model.addr) in (unicode, str):
+            self.addr_edit = QLineEdit(self.model.addr, self)
+        else:
+            self.addr_edit = QLineEdit('0x{:x}'.format(self.model.addr), self)
+        self.size_edit = QLineEdit('0x{:x}'.format(self.model.size), self)
+        self.psize_edit = QLineEdit('0x{:x}'.format(self.model.prev_size), self)
+
+        self.name_edit.editingFinished.connect(self.name_edited)
+        self.addr_edit.editingFinished.connect(self.addr_edited)
+        self.size_edit.editingFinished.connect(self.size_edited)
+        self.psize_edit.editingFinished.connect(self.psize_edited)
+
+        edit_layout = QHBoxLayout()
+        edit_layout.addWidget(QLabel('Name:'))
+        edit_layout.addWidget(self.name_edit)
+        edit_layout.addWidget(QLabel('Address:'))
+        edit_layout.addWidget(self.addr_edit)
+        edit_layout.addWidget(QLabel('Size:'))
+        edit_layout.addWidget(self.size_edit)
+        edit_layout.addWidget(QLabel('Prev. Size:'))
+        edit_layout.addWidget(self.psize_edit)
+
+        layout = QVBoxLayout()
+        layout.addLayout(edit_layout)
+        layout.addWidget(self.rop_view)
+        self.setLayout(layout)
+
+    def name_edited(self):
+        self.model.name = self.name_edit.text()
+        self.model.nameChanged.emit()
+
+    def addr_edited(self):
+        self.model.addr = parse_int(self.addr_edit.text(), None)
+        if self.model.addr is None:
+            self.model.addr = self.addr_edit.text()
+        if type(self.model.addr) in (str, unicode):
+            self.addr_edit.setText(self.model.addr)
+        else:
+            self.addr_edit.setText('0x{:x}'.format(self.model.addr))
+        self.model.dataChanged.emit(QModelIndex(), QModelIndex())
+
+    def size_edited(self):
+        self.model.size = parse_int(self.size_edit.text())
+        self.size_edit.setText('0x{:x}'.format(self.model.size))
+        self.model.dataChanged.emit(QModelIndex(), QModelIndex())
+
+    def psize_edited(self):
+        self.model.prev_size = parse_int(self.psize_edit.text())
+        self.psize_edit.setText('0x{:x}'.format(self.model.prev_size))
+        self.model.dataChanged.emit(QModelIndex(), QModelIndex())
+
+class RopEditorView(PluginForm):
+
+    DEFAULT_SP = 0xffff1000
+    DEFAULT_PC = 0xdeadbeef
+    DEFAULT_STACK_SIZE = 0xf000
+    DEFAULT_STACK_PREV_SIZE = 0x1000
+
+    def __init__(self, owner):
+        self.owner = owner
+        super(RopEditorView, self).__init__()
+        arch = UEMU_HELPERS.get_arch()
+        self.sp_mnem, self.uc_reg_sp = UEMU_HELPERS.get_stack_register(arch)
+        self.uc_reg_pc = self.owner.unicornEngine.uc_reg_pc
+        reg_map = UEMU_HELPERS.get_register_map(arch)
+        self.pc_mnem = {i[1]: i[0] for i in reg_map}[self.uc_reg_pc]
+        self.rop_models = [
+            RopModel('Stack', self.sp_mnem,
+                     self.DEFAULT_STACK_SIZE,
+                     self.DEFAULT_STACK_PREV_SIZE,
+            )
+        ]
+
+    def OnCreate(self, form):
+        self.parent = self.FormToPyQtWidget(form)
+        self.init_ui()
+
+    def get_default_ctx_src(self):
+        src = ''
+        src += '{} = 0x{:x} # stack pointer\n'.format(self.sp_mnem, self.DEFAULT_SP)
+        src += '{} = 0x{:x} # program counter\n'.format(self.pc_mnem, self.DEFAULT_PC)
+        return src
+
+    def init_ui(self):
+        self.text_edit = QTextEdit(self.parent)
+        src = self.get_default_ctx_src()
+        self.text_edit.setPlainText(src)
+
+        self.init_btn = QPushButton("Initiate", self.parent)
+        self.rop_save_btn = QPushButton("Save", self.parent)
+        self.rop_load_btn = QPushButton("Load", self.parent)
+        self.dump_trace_btn = QPushButton("Dump trace", self.parent)
+        self.dump_rop_btn = QPushButton("Dump rop", self.parent)
+
+        self.init_btn.clicked.connect(self.OnInitialize)
+        self.rop_save_btn.clicked.connect(self.OnRopSave)
+        self.rop_load_btn.clicked.connect(self.OnRopLoad)
+        self.dump_trace_btn.clicked.connect(self.OnDumpTrace)
+        self.dump_rop_btn.clicked.connect(self.OnDumpRop)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.init_btn)
+        button_layout.addWidget(self.rop_save_btn)
+        button_layout.addWidget(self.rop_load_btn)
+        button_layout.addWidget(self.dump_trace_btn)
+        button_layout.addWidget(self.dump_rop_btn)
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.addTab(self.text_edit, 'Context')
+        self.tabs.tabBar().tabButton(0, QTabBar.RightSide).deleteLater()
+        self.tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
+        self.tabs.tabCloseRequested.connect(self.handle_tab_close)
+
+
+        tb = QToolButton()
+        tb.setText('+')
+        tb.clicked.connect(self.OnNewTab)
+        self.tabs.addTab(QWidget(), '')
+        self.tabs.setTabEnabled(1, False)
+        self.tabs.tabBar().setTabButton(1, QTabBar.RightSide, tb)
+
+        self.update_rop_views()
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.tabs)
+        layout.addLayout(button_layout)
+
+        self.parent.setLayout(layout)
+
+    def update_rop_views(self):
+        n = max(0, self.tabs.count() - 2)
+        for i in range(n):
+            self.tabs.removeTab(1)
+        for i, rop_model in enumerate(self.rop_models):
+            self.tabs.insertTab(i + 1, RopTab(self.parent, rop_model), rop_model.name)
+
+            class TabNameSetter:
+
+                def __init__(self, parent, i):
+                    self.parent = parent
+                    self.i = i
+
+                def __call__(self):
+                    self.parent.tabs.setTabText(self.i + 1, self.parent.rop_models[self.i].name)
+
+            rop_model.nameChanged.connect(TabNameSetter(self, i))
+
+    def handle_tab_close(self, index):
+        # tab index to rop_model index
+        index = index - 1
+        del self.rop_models[index]
+        self.update_rop_views()
+
+    def update_context(self):
+        mu = self.owner.unicornEngine.mu
+        arch = UEMU_HELPERS.get_arch()
+        reg_map = dict(UEMU_HELPERS.get_register_map(arch))
+        reg_bit_size = UEMU_HELPERS.get_register_bits(arch)
+        reg_byte_size = reg_bit_size // 8
+        for rop_model in self.rop_models:
+            rop_model.highlights = {}
+        for reg in reg_map:
+            value = self.owner.unicornEngine.mu.reg_read(reg_map[reg])
+            for rop_model in self.rop_models:
+                if rop_model.init_addr is not None and\
+                        rop_model.init_addr <= value <= rop_model.init_addr + rop_model.size:
+                    index = (value - rop_model.init_addr) // reg_byte_size
+                    if index in rop_model.highlights:
+                        rop_model.highlights[index].append(reg)
+                    else:
+                        rop_model.highlights[index] = [reg]
+        for rop_model in self.rop_models:
+            rop_model.dataChanged.emit(QModelIndex(), QModelIndex())
+
+    def OnNewTab(self):
+        self.rop_models.append(
+            RopModel('Tab', self.sp_mnem,
+                 self.DEFAULT_STACK_SIZE,
+                 self.DEFAULT_STACK_PREV_SIZE,
+            )
+        )
+        self.update_rop_views()
+
+    def OnInitialize(self):
+
+        self.follow_regs = {}
+
+        ue = self.owner.unicornEngine
+        if ue.is_active():
+            ue.reset()
+
+        ue.emu_hooks = {}
+
+        # evaluate context
+        ctx = {
+            self.sp_mnem: self.DEFAULT_SP,
+            self.pc_mnem: self.DEFAULT_PC,
+            'hook': ue.set_hook,
+        }
+        src = self.text_edit.toPlainText()
+        try:
+            exec(
+                src,
+                {k: v for k, v in globals().items() if k.startswith('UC_')},
+                ctx
+            )
+        except Exception as ex:
+            uemu_log('[!] context evaluation error: {}'.format(ex))
+
+        arch = UEMU_HELPERS.get_arch()
+        reg_map = dict(UEMU_HELPERS.get_register_map(arch))
+        reg_bit_size = UEMU_HELPERS.get_register_bits(arch)
+
+        pc = ctx[self.pc_mnem]
+
+        ue.rop_tracer = RopTracer(ue)
+        ue.run_from(pc, True)
+
+        sp = ctx[self.sp_mnem]
+
+        for mnem, reg_value in ctx.items():
+            if mnem in reg_map:
+                ue.mu.reg_write(reg_map[mnem], reg_value)
+
+        for rop_model in self.rop_models:
+            addr = rop_model.addr
+            values = rop_model.values
+            if type(addr) in (str, unicode):
+                addr = ctx.get(addr, None)
+            if addr is None:
+                uemu_log('[!] Error address at {} rop tab: {}'.format(rop_model.name, rop_model.addr))
+                continue
+            rop_model.init_addr = addr
+            start = addr - rop_model.prev_size
+            end = addr + rop_model.size
+
+            ue.map_memory(start, end - start)
+            ue.mu.mem_write(addr, struct.pack(
+                ('%dQ' if reg_bit_size == 64 else '%dI')  % len(values),
+                *[i.get('addr', 0) for i in values]))
+
+        self.owner.update_context(ue.pc, ue.mu)
+
+    def OnRopSave(self):
+        file_path = IDAAPI_AskFile(1, "*.rop", "Rop Save")
+        if file_path is not None:
+            dump = {'ctx': self.text_edit.toPlainText(), 'rops': []}
+            for rop_model in self.rop_models:
+                dump['rops'].append({
+                    'name': rop_model.name,
+                    'addr': rop_model.addr,
+                    'size': rop_model.size,
+                    'psize': rop_model.prev_size,
+                    'values': rop_model.values
+                })
+            with open(file_path, 'wb') as f:
+                json.dump(dump, f)
+
+    def OnRopLoad(self):
+        file_path = IDAAPI_AskFile(0, "*.rop", "Rop Load")
+        if file_path is not None:
+            with open(file_path, 'rb') as f:
+                dump = json.load(f)
+            self.text_edit.setPlainText(dump['ctx'])
+            # load old save
+            if 'rop' in dump:
+                values = dump['rop']
+                self.rop_models = [
+                    RopModel('Stack', self.sp_mnem,
+                             self.DEFAULT_STACK_SIZE,
+                             self.DEFAULT_STACK_PREV_SIZE,
+                             values)
+                ]
+            else:
+                self.rop_models = []
+                for rop in dump['rops']:
+                    name = rop['name']
+                    addr = rop['addr']
+                    size = rop['size']
+                    psize = rop['psize']
+                    values = rop['values']
+                    self.rop_models.append(RopModel(name, addr, size, psize, values))
+            self.update_rop_views()
+
+
+    def OnDumpTrace(self):
+        if self.owner.unicornEngine.rop_tracer is None:
+            uemu_log('[!] Rop tracer not found')
+            return
+        file_path = IDAAPI_AskFile(1, "*.log", "Trac(e dump")
+        if file_path is not None:
+            with open(file_path, 'w') as f:
+                for line_addr, line_disas, line_changes in self.owner.unicornEngine.rop_tracer.get_trace():
+                    if len(line_changes) > 0:
+                        f.write('%s: %s  %s\n' % (line_addr, line_disas, '# ' + line_changes))
+                    else:
+                        f.write('%s: %s\n' % (line_addr, line_disas))
+                
+    def OnDumpRop(self):
+        file_path = IDAAPI_AskFile(1, "*.py", "Rop dump")
+        if file_path is not None:
+            with open(file_path, 'w') as f:
+                f.write('import struct\n\n\n')
+                f.write('REBASE =  0x0\n')
+                f.write('rop = b\'\'\n')
+                arch = UEMU_HELPERS.get_arch()
+                reg_bit_size = UEMU_HELPERS.get_register_bits(arch)
+                fmt = 'I' if reg_bit_size == 32 else 'Q'
+                for rop_model in self.rop_models:
+                    name = rop_model.name
+                    values = rop_model.values
+                    for i in values:
+                        addr = i['addr']
+                        if IDAAPI_IsLoaded(addr):
+                            f.write('rop_%s += struct.pack(\'%s\', REBASE + 0x%x)\n' % (name, fmt, addr))
+                        else:
+                            f.write('rop_%s += struct.pack(\'%s\', 0x%x)\n' % (name, fmt, addr))
+
+    def OnClose(self, form):
+        self.owner.rop_editor_view_closed()
+
 # === uEmuControlView
 
 class uEmuControlView(PluginForm):
@@ -715,7 +1434,7 @@ class uEmuControlView(PluginForm):
         hbox.addWidget(btnStep)
         hbox.addWidget(btnStop)
 
-        self.parent.setLayout(hbox) 
+        self.parent.setLayout(hbox)
 
     def OnEmuStart(self, code=0):
         self.owner.emu_start()
@@ -772,14 +1491,14 @@ class uEmuMappeduMemoryView(IDAAPI_Choose):
         self.owner.show_memory(address, size)
 
     def OnGetLine(self, n):
-        return [ 
-            "0x%X" % self.items[n][0], 
-            "0x%X" % self.items[n][1], 
+        return [
+            "0x%X" % self.items[n][0],
+            "0x%X" % self.items[n][1],
             "%c%c%c" % (
                 "r" if self.items[n][2] & UC_PROT_READ else "-",
                 "w" if self.items[n][2] & UC_PROT_WRITE else "-",
                 "x" if self.items[n][2] & UC_PROT_EXEC else "-")
-        ] 
+        ]
 
     def OnGetSize(self):
         n = len(self.items)
@@ -804,9 +1523,11 @@ BUTTON CANCEL Cancel
 uEmu Settings
 <Follow PC:{chk_followpc}>
 <Convert to Code automatically:{chk_forcecode}>
-<Trace instructions:{chk_trace}>{emu_group}>
+<Trace instructions:{chk_trace}>
+<Lazy mapping:{chk_lazymapping}>{emu_group}>
 """, {
-        'emu_group': Form.ChkGroupControl(("chk_followpc", "chk_forcecode", "chk_trace")),
+        'emu_group': Form.ChkGroupControl(
+            ("chk_followpc", "chk_forcecode", "chk_trace", "chk_lazymapping")),
         })
 
 # === uEmuUnicornEngine
@@ -861,6 +1582,23 @@ Map Binary File
         'total_label': Form.StringLabel(""),
         'form_change_cb': Form.FormChangeCb(self.OnFormChange)
         })
+    
+    def SetControlValue(self, ctrl, value):
+        '''
+        temporary fix for IDA 7.4
+        '''
+        if __package__ or '.' in __name__:
+            from . import _ida_kernwin
+        else:
+            import _ida_kernwin
+        if isinstance(ctrl, Form.StringLabel):
+            tid = 3
+        else:
+            tid, _ = self.ControlToFieldTypeIdAndSize(ctrl)
+        return _ida_kernwin.formchgcbfa_set_field_value(self.p_fa,
+                                                        ctrl.id,
+                                                        tid,
+                                                        value)
 
     def OnFormChange(self, fid):
         if fid == self.file_name.id:
@@ -929,7 +1667,7 @@ class uEmuContextInitDialog(IDAAPI_Choose):
         self.Refresh()
 
     def OnGetLine(self, n):
-        return [ self.items[n][0], self.items[n][1] ] 
+        return [ self.items[n][0], self.items[n][1] ]
 
     def OnGetSize(self):
         n = len(self.items)
@@ -971,11 +1709,16 @@ class uEmuUnicornEngine(object):
         }
         arch = UEMU_HELPERS.get_arch()
 
-        self.uc_reg_pc = uc_setup[arch][0]
-        self.uc_arch = uc_setup[arch][1]
-        self.uc_mode = uc_setup[arch][2]
+        self.uc_reg_pc, self.uc_arch, self.uc_mode = uc_setup[arch]
+        _, self.uc_reg_sp = UEMU_HELPERS.get_stack_register(arch)
         uemu_log("Unicorn version [ %s ]" % (unicorn.__version__))
         uemu_log("CPU arch set to [ %s ]" % (arch))
+
+        self.rop_tracer = None
+        self.emu_hooks = {}
+
+    def set_hook(self, addr, func):
+        self.emu_hooks[addr] = func
 
     def is_active(self):
         return self.emuActive
@@ -1022,11 +1765,7 @@ class uEmuUnicornEngine(object):
         IDAAPI_SetColor(self.pc, CIC_ITEM, UEMU_CONFIG.IDAViewColor_PC)
 
         if not self.emuActive:
-            if self.owner.trace_inst():
-                bytes = IDAAPI_GetBytes(self.pc, IDAAPI_NextHead(self.pc) - self.pc)
-                bytes_hex = " ".join("{:02X}".format(ord(c)) for c in bytes)
-                uemu_log("* TRACE<I> 0x%X | %-16s | %s" % (self.pc, bytes_hex, IDAAPI_GetDisasm(self.pc, 0)))
-
+            self.trace()
             self.emuActive = True
 
     def is_memory_mapped(self, address):
@@ -1106,7 +1845,7 @@ class uEmuUnicornEngine(object):
             find_inited = False
         else:
             find_inited = True
-        ptr = IDAAPI_NextThat(start, -1, UEMU_HELPERS.InitedCallable() if find_inited else UEMU_HELPERS.UninitedCallable())
+        ptr = IDAAPI_NextThat(start, end, UEMU_HELPERS.InitedCallable() if find_inited else UEMU_HELPERS.UninitedCallable())
         while ptr < end:
             if not find_inited:
                 # found uninitialized
@@ -1119,7 +1858,7 @@ class uEmuUnicornEngine(object):
                 start = ptr
 
             find_inited = not find_inited
-            ptr = IDAAPI_NextThat(ptr, -1, UEMU_HELPERS.InitedCallable() if find_inited else UEMU_HELPERS.UninitedCallable())
+            ptr = IDAAPI_NextThat(ptr, end, UEMU_HELPERS.InitedCallable() if find_inited else UEMU_HELPERS.UninitedCallable())
         # process tail if any
         if not find_inited:
             tmp_end = end if ptr > end else ptr
@@ -1127,7 +1866,7 @@ class uEmuUnicornEngine(object):
             self.mu.mem_write(start, IDAAPI_GetBytes(start, tmp_end - start))
 
     def fetch_segments(self):
-        uemu_log("Fetching segments...")        
+        uemu_log("Fetching segments...")
         for segEA in Segments():
             segStart = IDAAPI_SegStart(segEA)
             segEnd = IDAAPI_SegEnd(segEA)
@@ -1190,8 +1929,19 @@ class uEmuUnicornEngine(object):
             execute_sync(uEmuOnMainCallable(result_handler), MFF_WRITE)
 
     def hook_mem_invalid(self, uc, access, address, size, value, user_data):
+
+
         def result_handler():
+
             uemu_log("! <M> Missing memory at 0x%x, data size = %u, data value = 0x%x" %(address, size, value))
+
+            if self.owner.lazy_mapping() and IDAAPI_IsLoaded(address):
+                page_start = UEMU_HELPERS.ALIGN_PAGE_DOWN(address)
+                page_end = UEMU_HELPERS.ALIGN_PAGE_UP(address + size)
+                self.map_memory(page_start, page_end - page_start)
+                self.copy_inited_data(page_start, page_end)
+                return True
+
             while True:
                 ok = IDAAPI_AskYN(1, "Memory [%X] is not mapped!\nDo you want to map it?\n   YES - Load Binary\n   NO - Fill page with zeroes\n   Cancel - Stop Emulation" % (address))
                 if ok == 0:
@@ -1203,16 +1953,17 @@ class uEmuUnicornEngine(object):
                 else:
                     self.interrupt()
                     break
+
             return True
 
         execute_sync(uEmuOnMainCallable(result_handler), MFF_WRITE)
         return True
 
-    def init_cpu_context(self, pc):
+    def init_cpu_context(self, pc, skip_ctx_init):
         self.extended = False
         
         # enable ARMv7 VFP
-        if UEMU_HELPERS.get_arch() in ["armle", "armbe"]: 
+        if UEMU_HELPERS.get_arch() in ["armle", "armbe"]:
             if IDAAPI_AskYN(1, "Enable VFP instruction emulation?") == 1:
                 tmp_val = self.mu.reg_read(UC_ARM_REG_C1_C0_2)
                 tmp_val = tmp_val | (0xf << 20)
@@ -1222,7 +1973,7 @@ class uEmuUnicornEngine(object):
                 self.extended = True
                 uemu_log("VFP enabled")
         # enable ARMv8 FP/SIMD
-        if UEMU_HELPERS.get_arch() in ["arm64le", "arm64be"]: 
+        if UEMU_HELPERS.get_arch() in ["arm64le", "arm64be"]:
             if IDAAPI_AskYN(1, "Enable FP/SIMD instruction emulation?") == 1:
                 cpacr = self.mu.reg_read(UC_ARM64_REG_CPACR_EL1)
                 cpacr = cpacr | (0x3 << 20)
@@ -1236,6 +1987,9 @@ class uEmuUnicornEngine(object):
         if self.extended:
             reg_ext_map = UEMU_HELPERS.get_register_ext_map(UEMU_HELPERS.get_arch())
             regs = regs + [ [ row[0], "0x0", UEMU_HELPERS.get_register_ext_bits(UEMU_HELPERS.get_arch()) ] for row in reg_ext_map ]
+
+        if skip_ctx_init:
+            return True
 
         cpuContext = uEmuContextInitDialog(regs)
         ok = cpuContext.show()
@@ -1270,46 +2024,44 @@ class uEmuUnicornEngine(object):
         else:
             return False
 
-    def run_from(self, address):
+    def run_from(self, address, skip_ctx_init=False):
         self.mu = Uc(self.uc_arch, self.uc_mode)
-        self.mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, self.hook_mem_invalid)
+        self.mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, self.hook_mem_invalid)
         self.mu.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, self.hook_mem_access)
         self.pc = address
 
         try:
-            if self.init_cpu_context(address) == False:
+            if self.init_cpu_context(address, skip_ctx_init) == False:
                 return
 
-            uemu_log("Mapping segments...")
+            if not self.owner.lazy_mapping():
+                uemu_log("Mapping segments...")
 
-            # get all segments and merge neighbours
-            lastAddress = BADADDR
-            for segEA in Segments():
-                segStart = IDAAPI_SegStart(segEA)
-                segEnd = IDAAPI_SegEnd(segEA)
-                endAligned = UEMU_HELPERS.ALIGN_PAGE_UP(segEnd)
+                # get all segments and merge neighbours
+                lastAddress = BADADDR
+                for segEA in Segments():
+                    segStart = IDAAPI_SegStart(segEA)
+                    segEnd = IDAAPI_SegEnd(segEA)
+                    endAligned = UEMU_HELPERS.ALIGN_PAGE_UP(segEnd)
 
-                # merge with provious if
-                # - we have mapped some segments already
-                # - aligned old segment is overlapping new segment
-                # otherwise map new
+                    # merge with provious if
+                    # - we have mapped some segments already
+                    # - aligned old segment is overlapping new segment
+                    # otherwise map new
 
-                uemu_log("* seg [%X:%X]" % (segStart, segEnd))
-                if lastAddress != BADADDR and lastAddress > segStart:
-                    if lastAddress < segEnd:
-                        self.map_memory(lastAddress, endAligned - lastAddress)
-                else:
-                    self.map_memory(segStart, endAligned - segStart)
+                    uemu_log("* seg [%X:%X]" % (segStart, segEnd))
+                    if lastAddress != BADADDR and lastAddress > segStart:
+                        if lastAddress < segEnd:
+                            self.map_memory(lastAddress, endAligned - lastAddress)
+                    else:
+                        self.map_memory(segStart, endAligned - segStart)
 
-                # copy initialized bytes
-                self.copy_inited_data(segStart, segEnd)                
+                    # copy initialized bytes
+                    self.copy_inited_data(segStart, segEnd)
 
-                lastAddress = endAligned
+                    lastAddress = endAligned
 
-            if self.owner.trace_inst():
-                bytes = IDAAPI_GetBytes(self.pc, IDAAPI_NextHead(self.pc) - self.pc)
-                bytes_hex = " ".join("{:02X}".format(ord(c)) for c in bytes)
-                uemu_log("* TRACE<I> 0x%X | %-16s | %s" % (self.pc, bytes_hex, IDAAPI_GetDisasm(self.pc, 0)))
+            self.trace()
 
             IDAAPI_SetColor(self.pc, CIC_ITEM, UEMU_CONFIG.IDAViewColor_PC)
             self.emuActive = True
@@ -1317,9 +2069,21 @@ class uEmuUnicornEngine(object):
         except UcError as e:
             uemu_log("! <U> %s" % e)
 
+    def trace(self):
+        if self.owner.trace_inst():
+            bytes = IDAAPI_GetBytes(self.pc, IDAAPI_NextHead(self.pc) - self.pc)
+            bytes_hex = " ".join("{:02X}".format(ord(c)) for c in bytes)
+            uemu_log("* TRACE<I> 0x%X | %-16s | %s" % (self.pc, bytes_hex, IDAAPI_GetDisasm(self.pc, 0)))
+        if self.rop_tracer is not None:
+            self.rop_tracer.trace()
+
+
     def step_thread_main(self):
         try:
-            self.mu.emu_start(self.pc | 1 if UEMU_HELPERS.is_thumb_ea(self.pc) else self.pc, -1, count=1)
+            if self.pc in self.emu_hooks:
+                self.emu_hooks[self.pc](self.mu)
+            else:
+                self.mu.emu_start(self.pc | 1 if UEMU_HELPERS.is_thumb_ea(self.pc) else self.pc, -1, count=1)
             # vvv Workaround to fix issue when registers are still updated even if emu_stop is called
             if self.fix_context is not None:
                 self.mu.context_restore(self.fix_context)
@@ -1327,10 +2091,7 @@ class uEmuUnicornEngine(object):
             # ^^^
             def result_handler():
                 self.pc = self.mu.reg_read(self.uc_reg_pc)
-                if self.owner.trace_inst():
-                    bytes = IDAAPI_GetBytes(self.pc, IDAAPI_NextHead(self.pc) - self.pc)
-                    bytes_hex = " ".join("{:02X}".format(ord(c)) for c in bytes)
-                    uemu_log("* TRACE<I> 0x%X | %-16s | %s" % (self.pc, bytes_hex, IDAAPI_GetDisasm(self.pc, 0)))
+                self.trace()
 
                 if not IDAAPI_IsCode(IDAAPI_GetFlags(self.pc)) and self.owner.force_code():
                     uemu_log("Creating code at 0x%X" % (self.pc))
@@ -1439,10 +2200,11 @@ class uEmuUnicornEngine(object):
             uemu_log("  unmap [%X:%X]" % (start, end))
             self.mu.mem_unmap(start, end - start + 1)
 
-        IDAAPI_SetColor(self.pc, CIC_ITEM, UEMU_CONFIG.IDAViewColor_Reset)    
+        IDAAPI_SetColor(self.pc, CIC_ITEM, UEMU_CONFIG.IDAViewColor_Reset)
         self.pc = BADADDR
         self.mu = None
         self.emuActive = False
+        self.rop_tracer = None
 
 # === uEmuPlugin
 
@@ -1462,18 +2224,22 @@ class uEmuPlugin(plugin_t, UI_Hooks):
     unicornEngine = None
 
     settings = {
-        "follow_pc"     : False,
+        "follow_pc"     : True,
         "force_code"    : False,
         "trace_inst"    : False,
+        "lazy_mapping"  : True,
     }
 
+    ropEditorView = None
     controlView = None
     emuInitView = None
     cpuContextView = None
     cpuExtContextView = None
+    stackView = None
+    ropTraceView = None
     memoryViews = {}
 
-    # --- PLUGIN LIFECYCLE 
+    # --- PLUGIN LIFECYCLE
 
     def init(self):
         super(uEmuPlugin, self).__init__()
@@ -1526,6 +2292,9 @@ class uEmuPlugin(plugin_t, UI_Hooks):
     def trace_inst(self):
         return self.settings["trace_inst"]
 
+    def lazy_mapping(self):
+        return self.settings["lazy_mapping"]
+
     def load_project(self):
         filePath = IDAAPI_AskFile(0, "*.emu", "Open eEmu project")
         if filePath is None:
@@ -1559,6 +2328,7 @@ class uEmuPlugin(plugin_t, UI_Hooks):
             shortcut,       # Optional: the action shortcut
             tooltip,        # Optional: the action tooltip (available in menus/toolbar)
             icon)           # Optional: the action icon (shows when in menus/toolbars)
+
         register_action(new_action)
 
     def handle_menu_action(self, action):
@@ -1578,6 +2348,9 @@ class uEmuPlugin(plugin_t, UI_Hooks):
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":cpu_view",          self.show_cpu_context,      "Show CPU Context",           "Show CPU Registers",        None,                   True    ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":cpu_ext_view",      self.show_cpu_ext_context,  "Show CPU Extended Context",  "Show Extended Registers",   None,                   True    ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":mem_view",          self.show_memory,           "Show Memory Range",          "Show Memory Range",         None,                   True    ))
+        self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":stack_view",        self.show_stack_view,       "Show Stack View",            "Show Stack View",           None,                   True    ))
+        self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":rop_trace_view",    self.show_rop_trace_view,   "Show Rop Trace View",        "Show Rop Trace View",       "SHIFT+CTRL+ALT+T",     True    ))
+        self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":rop_editor_view",   self.show_rop_editor_view,  "Show Rop Editor View",       "Show Rop Editor View",      "SHIFT+CTRL+ALT+R",     True    ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":mem_map",           self.show_mapped,           "Show Mapped Memory",         "Show Mapped Memory",        None,                   False   ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":fetch_segs",        self.fetch_segments,        "Fetch Segments",             "Fetch Segments",            None,                   False   ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem("-",                                     self.do_nothing,            "",                           None,                        None,                   False   ))
@@ -1585,7 +2358,7 @@ class uEmuPlugin(plugin_t, UI_Hooks):
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":save_prj",          self.save_project,          "Save Project",               "Save Project",              None,                   False   ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":settings",          self.show_settings,         "Settings",                   "Settings",                  None,                   False   ))
         self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem("-",                                     self.do_nothing,            "",                           None,                        None,                   False   ))
-        self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":unload",            self.unload_plugin,         "Unload Plugin",              "Unload Plugin",             None,                   False   ))
+        self.MENU_ITEMS.append(UEMU_HELPERS.MenuItem(UEMU_PLUGIN_NAME + ":unload",            self.unload_plugin,         "Unload Plugin",              "Unload Plugin",             "SHIFT+CTRL+ALT+U",     False   ))
 
         for item in self.MENU_ITEMS:
             if item.action == "-":
@@ -1635,6 +2408,9 @@ class uEmuPlugin(plugin_t, UI_Hooks):
     def contol_view_closed(self):
         self.controlView = None
 
+    def rop_editor_view_closed(self):
+        self.ropEditorView= None
+
     def context_view_closed(self):
         self.cpuContextView = None
 
@@ -1643,6 +2419,12 @@ class uEmuPlugin(plugin_t, UI_Hooks):
 
     def memory_view_closed(self, viewid):
         del self.memoryViews[viewid]
+
+    def stack_view_closed(self):
+        self.stackView = None
+
+    def rop_trace_view_closed(self):
+        self.ropTraceView = None
 
     def update_context(self, address, context):
         # Update CPU Context Views
@@ -1654,6 +2436,19 @@ class uEmuPlugin(plugin_t, UI_Hooks):
         # Update Memory Views
         for viewid in self.memoryViews:
             self.memoryViews[viewid].SetContent(context)
+
+        # Update Stack View
+        if self.stackView is not None:
+            self.stackView.SetContent(context)
+
+        if self.ropEditorView is not None:
+            self.ropEditorView.update_context()
+        # Update Rop Editor
+
+
+        # Update Rop Trace View
+        if self.ropTraceView is not None:
+            self.ropTraceView.SetContent(self.unicornEngine.rop_tracer)
 
     # --- METHODS
 
@@ -1691,9 +2486,9 @@ class uEmuPlugin(plugin_t, UI_Hooks):
         count = 1
         if UEMU_HELPERS.is_alt_pressed():
             count = IDAAPI_AskLong(1, "Enter Step Count")
-            if count is None or count < 0: 
+            if count is None or count < 0:
                 return
-            if count == 0: 
+            if count == 0:
                 count = 1
 
         self.unicornEngine.step(count)
@@ -1806,10 +2601,39 @@ class uEmuPlugin(plugin_t, UI_Hooks):
                         return
 
                 self.memoryViews[mem_addr] = uEmuMemoryView(self, mem_addr, mem_size)
-                self.memoryViews[mem_addr].Create("uEmu Memory [ " + mem_cmnt + " ]")
+                self.memoryViews[mem_addr].Create("uEmu Memory [ " + mem_cmnt.encode('utf8') + " ]")
                 self.memoryViews[mem_addr].SetContent(self.unicornEngine.mu)
             self.memoryViews[mem_addr].Show()
             self.memoryViews[mem_addr].Refresh()
+
+    def show_rop_trace_view(self):
+        if not self.unicornEngine.is_active():
+            uemu_log("Emulator is not active")
+            return
+
+        if self.ropTraceView is None:
+            self.ropTraceView = uEmuRopTraceView(self)
+            self.ropTraceView.Create("uEmu Rop Trace View")
+            self.ropTraceView.SetContent(self.unicornEngine.rop_tracer)
+            self.ropTraceView.Show()
+            self.ropTraceView.Refresh()
+
+    def show_rop_editor_view(self):
+        if self.ropEditorView is None:
+            self.ropEditorView = RopEditorView(self)
+            self.ropEditorView.Show('RopEditor')
+
+    def show_stack_view(self):
+        if not self.unicornEngine.is_active():
+            uemu_log("Emulator is not active")
+            return
+
+        if self.stackView is None:
+            self.stackView = uEmuStackView(self)
+            self.stackView.Create("uEmu Stack View")
+            self.stackView.SetContent(self.unicornEngine.mu)
+            self.stackView.Show()
+            self.stackView.Refresh()
 
     def show_mapped(self):
         if not self.unicornEngine.is_active():
@@ -1834,6 +2658,7 @@ class uEmuPlugin(plugin_t, UI_Hooks):
         kSettingsMask_FollowPC  = 0x1
         kSettingsMask_ForceCode = 0x2
         kSettingsMask_TraceInst = 0x4
+        kSettingsMask_LazyMapping = 0x8
 
         settingsDlg = uEmuSettingsDialog()
         settingsDlg.Compile()
@@ -1842,14 +2667,32 @@ class uEmuPlugin(plugin_t, UI_Hooks):
         if self.settings["follow_pc"]: settingsDlg.emu_group.value = settingsDlg.emu_group.value | kSettingsMask_FollowPC
         if self.settings["force_code"]: settingsDlg.emu_group.value = settingsDlg.emu_group.value | kSettingsMask_ForceCode
         if self.settings["trace_inst"]: settingsDlg.emu_group.value = settingsDlg.emu_group.value | kSettingsMask_TraceInst
+        if self.settings["lazy_mapping"]: settingsDlg.emu_group.value = settingsDlg.emu_group.value | kSettingsMask_LazyMapping
 
         ok = settingsDlg.Execute()
         if ok == 1:
             self.settings["follow_pc"] = True if settingsDlg.emu_group.value & kSettingsMask_FollowPC else False
             self.settings["force_code"] = True if settingsDlg.emu_group.value & kSettingsMask_ForceCode else False
             self.settings["trace_inst"] = True if settingsDlg.emu_group.value & kSettingsMask_TraceInst else False
+            self.settings["lazy_mapping"] = True if settingsDlg.emu_group.value & kSettingsMask_LazyMapping else False
 
     def close_windows(self):
+        if self.ropEditorView is not None:
+            self.ropEditorView.Close(0)
+            self.ropEditorView = None
+        
+        if self.ropTraceView is not None:
+            self.ropTraceView.Close()
+            self.ropTraceView = None
+
+        if self.stackView is not None:
+            self.stackView.Close()
+            self.stackView = None
+
+        if self.controlView is not None:
+            self.controlView.Close(0)
+            self.controlView = None
+
         if self.cpuContextView is not None:
             self.cpuContextView.Close()
             self.cpuContextView = None
