@@ -1,3 +1,10 @@
+![](Resources/crauEmu_logo.png)
+
+*\* Mascot designed by [@kottsarapkin](https://www.instagram.com/kottsarapkin/)*
+
+**crauEmu** is a modified version of **uEmu** for developing and analyzing payloads for code-reuse attacks.
+
+
 ## Overview
 
 **uEmu** is a tiny cute emulator plugin for IDA based on unicorn engine.
@@ -72,7 +79,7 @@ Resets emulator instance and unmaps all memory regions.
 
 ### Breakpoints
 
-You can use IDA breakpoints to indicate locations where emulation should be interrupted. 
+You can use IDA breakpoints to indicate locations where emulation should be interrupted.
 This includes code and memory breakpoints.
 Usually used together with **Run** command.
 
@@ -178,7 +185,3 @@ Please note that only registers defined in a plugin are saved.
 - **Trace instructions** prints every instruction emulator is executing
 
 ![](./Resources/screenshots/doc_settings.png)
-
-
-
-
