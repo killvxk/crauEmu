@@ -5,6 +5,15 @@
 **crauEmu** is a modified version of **uEmu** for developing and analyzing payloads for code-reuse attacks.
 
 
+* [Slides from ZeroNights 2019](Resources/crau.pdf)
+* [Demo 1 - X32-64, Edge, rop-gadgets from pwnjs](Resources/videos/demo01_edge.mp4)
+* [Demo 2 - ARM64, checkm8 callback-chain](Resources/videos/demo02_checkm8.mp4)
+
+#### RopEditor
+
+![](Resources/screenshots/ropeditor_context.png)
+![](Resources/screenshots/ropeditor_payload.png)
+
 ## Overview
 
 **uEmu** is a tiny cute emulator plugin for IDA based on unicorn engine.
